@@ -1,0 +1,129 @@
+name: Build Active Time Widget APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      gadgetbridge_repo:
+        description: Gadgetbridge git repository to patch
+        required: true
+        default: https://codeberg.org/Freeyourgadget/Gadgetbridge.git
+      gadgetbridge_ref:
+        description: Branch, tag, or commit to patch
+        required: true
+        default: master
+      fallback_gadgetbridge_repo:
+        description: Optional fallback repository if the primary clone fails after retries
+        required: false
+        default: https://github.com/Freeyourgadget/Gadgetbridge.git
+  push:
+    paths:
+      - scripts/add-active-time-widget.sh
+      - .github/workflows/build-active-time-widget-apk.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out runner files
+        uses: actions/checkout@v4
+
+      - name: Clone Gadgetbridge with retries
+        shell: bash
+        env:
+          GADGETBRIDGE_REPO: ${{ inputs.gadgetbridge_repo || 'https://codeberg.org/Freeyourgadget/Gadgetbridge.git' }}
+          GADGETBRIDGE_REF: ${{ inputs.gadgetbridge_ref || 'master' }}
+          FALLBACK_GADGETBRIDGE_REPO: ${{ inputs.fallback_gadgetbridge_repo || 'https://github.com/Freeyourgadget/Gadgetbridge.git' }}
+        run: |
+          set -euo pipefail
+
+          clone_repo() {
+            local repo="$1"
+            local ref="$2"
+            local attempts=5
+
+            for attempt in $(seq 1 "$attempts"); do
+              echo "Clone attempt ${attempt}/${attempts}: ${repo} @ ${ref}"
+              rm -rf gadgetbridge
+
+              if git -c http.version=HTTP/1.1 clone --depth 1 --branch "$ref" "$repo" gadgetbridge; then
+                return 0
+              fi
+
+              echo "Clone attempt ${attempt} failed. Retrying..."
+              sleep $((attempt * 10))
+            done
+
+            return 1
+          }
+
+          if ! clone_repo "$GADGETBRIDGE_REPO" "$GADGETBRIDGE_REF"; then
+            if [[ -n "${FALLBACK_GADGETBRIDGE_REPO:-}" && "$FALLBACK_GADGETBRIDGE_REPO" != "$GADGETBRIDGE_REPO" ]]; then
+              echo "Primary repository failed after retries. Trying fallback: $FALLBACK_GADGETBRIDGE_REPO"
+              clone_repo "$FALLBACK_GADGETBRIDGE_REPO" "$GADGETBRIDGE_REF"
+            else
+              echo "Primary repository failed and no fallback repository is configured." >&2
+              exit 1
+            fi
+          fi
+
+          cd gadgetbridge
+          git submodule update --init --recursive
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+          cache-dependency-path: |
+            gadgetbridge/**/*.gradle*
+            gadgetbridge/**/gradle-wrapper.properties
+            gadgetbridge/**/gradle/libs.versions.toml
+            gadgetbridge/**/versions.properties
+
+      - name: Add Active Time widget files
+        run: |
+          mkdir -p gadgetbridge/scripts
+          cp scripts/add-active-time-widget.sh gadgetbridge/scripts/add-active-time-widget.sh
+          cd gadgetbridge
+          bash scripts/add-active-time-widget.sh
+
+      - name: Create patch artifact
+        run: |
+          cd gadgetbridge
+          # Include newly-created files in the diff, but keep the copied helper script out of the patch.
+          git add -N app/src/main/java/nodomain/freeyourgadget/gadgetbridge/ActiveTimeWidget.java \
+            app/src/main/res/layout/active_time_widget.xml \
+            app/src/main/res/xml/active_time_widget_info.xml
+          git diff --binary -- app/src/main > ../active-time-widget.patch
+          git status --short
+          test -s ../active-time-widget.patch
+
+      - name: Upload patch
+        uses: actions/upload-artifact@v4
+        with:
+          name: active-time-widget-patch
+          path: active-time-widget.patch
+          if-no-files-found: error
+
+      - name: Build patched Gadgetbridge debug APK
+        working-directory: gadgetbridge
+        run: ./gradlew --no-daemon :app:assembleMainDebug
+
+      - name: Collect APK
+        run: |
+          mkdir -p artifacts
+          find gadgetbridge/app/build/outputs/apk -type f -name '*.apk' -print -exec cp {} artifacts/ \;
+          ls -lh artifacts
+          test -n "$(find artifacts -type f -name '*.apk' -print -quit)"
+
+      - name: Upload patched APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: gadgetbridge-active-time-widget-apk
+          path: artifacts/*.apk
+          if-no-files-found: error
